@@ -62,7 +62,7 @@ The table below compares the computational complexity (in Giga FLOPs) and model 
 
 ## References
 
-[1] M. Abdollahpour, M. Bertuletti, Y. Zhang, Y. Li, L. Benini, and A. Vanelli-Coralli, "[A Compute&Memory Efficient Model-Driven Neural 5G Receiver for Edge AI-assisted RAN](https://arxiv.org/pdf/)", GLOBECOM, Dec. 2025.
+[1] M. Abdollahpour, M. Bertuletti, Y. Zhang, Y. Li, L. Benini, and A. Vanelli-Coralli, "[A Compute&Memory Efficient Model-Driven Neural 5G Receiver for Edge AI-assisted RAN](https://arxiv.org/pdf/2508.12892)", GLOBECOM, Dec. 2025.
 
 
 ## License
