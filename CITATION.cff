@@ -1,0 +1,65 @@
+cff-version: 1.2.0
+message: "If you use this software, please cite it as below, together with the papers of the models you use."
+title: "MDX: Efficient Neural 5G NR Receivers and Channel Estimators"
+type: software
+authors:
+  - family-names: Abdollahpour
+    given-names: Mahdi
+    affiliation: University of Bologna
+version: v1
+repository-code: "https://github.com/Mahdi-Abdollahpour/mdx"
+keywords:
+  - 5G NR
+  - neural receiver
+  - channel estimation
+  - PUSCH
+  - Sionna
+references:
+  - type: conference-paper
+    title: "A Compute&Memory Efficient Model-Driven Neural 5G Receiver for Edge AI-assisted RAN"
+    authors:
+      - family-names: Abdollahpour
+        given-names: Mahdi
+      - family-names: Bertuletti
+        given-names: Marco
+      - family-names: Zhang
+        given-names: Yichao
+      - family-names: Li
+        given-names: Yawei
+      - family-names: Benini
+        given-names: Luca
+      - family-names: Vanelli-Coralli
+        given-names: Alessandro
+    collection-title: "IEEE Global Communications Conference (GLOBECOM)"
+    year: 2025
+    url: "https://arxiv.org/abs/2508.12892"
+  - type: conference-paper
+    title: "On-board AI-based Channel Estimation for LEO NTNs"
+    authors:
+      - family-names: Abdollahpour
+        given-names: Mahdi
+      - family-names: De Filippo
+        given-names: Bruno
+      - family-names: Amatetti
+        given-names: Carla
+      - family-names: Vanelli-Coralli
+        given-names: Alessandro
+    collection-title: "IEEE International Workshop on Signal Processing Advances in Wireless Communications (SPAWC)"
+    year: 2026
+    url: "https://arxiv.org/abs/2607.15127"
+  - type: conference-paper
+    title: "Scalable Attention for 5G NR Channel Estimation"
+    authors:
+      - family-names: Abdollahpour
+        given-names: Mahdi
+      - family-names: Bertuletti
+        given-names: Marco
+      - family-names: Zhang
+        given-names: Yichao
+      - family-names: Benini
+        given-names: Luca
+      - family-names: Vanelli-Coralli
+        given-names: Alessandro
+    collection-title: "IEEE International Symposium on Personal, Indoor and Mobile Radio Communications (PIMRC) Workshops"
+    year: 2026
+    url: "https://arxiv.org/abs/2607.16462"

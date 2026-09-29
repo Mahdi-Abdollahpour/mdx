@@ -1,22 +1,87 @@
-# Modified to support MDX & Extra features
-# Mahdi Abdollahpour (mahdi.abdollahpour@unibo.it)
-# 2025
+"""Shared utility helpers."""
+
+from .debug_utils import dbg, tattle
+from .math_utils import (
+    huber,
+    masked_quantile,
+    masked_reduce_max,
+    masked_reduce_mean,
+    masked_reduce_min,
+    mse,
+)
+
+__all__ = [
+    "COLORMAP",
+    "_flatten_dims",
+    "_insert_dims",
+    "_squeeze",
+    "_squeeze_inds_nd",
+    "_squeeze_inds_nd_",
+    "_stop_gradients",
+    "c2ri",
+    "collapse_axes",
+    "dbg",
+    "huber",
+    "masked_quantile",
+    "masked_reduce_max",
+    "masked_reduce_mean",
+    "masked_reduce_min",
+    "mse",
+    "plot_error_metric_results",
+    "ri2c",
+    "swap_axis",
+    "tattle",
+]
 
 
-# SPDX-FileCopyrightText: Copyright (c) 2024 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
-# SPDX-License-Identifier: LicenseRef-NvidiaProprietary
-#
-# NVIDIA CORPORATION, its affiliates and licensors retain all intellectual
-# property and proprietary rights in and to this material, related
-# documentation and any modifications thereto. Any use, reproduction,
-# disclosure or distribution of this material and related documentation
-# without an express license agreement from NVIDIA CORPORATION or
-# its affiliates is strictly prohibited.
+def __getattr__(name):
+    """Lazily import the plotting and tensor helpers on first access."""
+    if name in {"COLORMAP", "plot_error_metric_results"}:
+        from .eval_plots import COLORMAP, plot_error_metric_results
 
-from .baseline_rx import BaselineReceiver
-from .e2e_model import E2E_Model
-from .neural_rx import NeuralPUSCHReceiver, NeuralReceiverONNX
-from .parameters import Parameters
-from .utils import load_weights, training_loop, save_weights, plot_results, plot_gp, export_constellation, sample_along_trajectory, serialize_example
-from .channel_models import DoubleTDLChannel, DatasetChannel
-from .model_weights import print_model_layers, model_comp, compute_lr_multipliers, transfer_weights_from_h5
+        globals()["COLORMAP"] = COLORMAP
+        globals()["plot_error_metric_results"] = plot_error_metric_results
+        return globals()[name]
+
+    if name in {
+        "_flatten_dims",
+        "_insert_dims",
+        "_squeeze",
+        "_squeeze_inds_nd",
+        "_squeeze_inds_nd_",
+        "_stop_gradients",
+        "c2ri",
+        "collapse_axes",
+        "ri2c",
+        "swap_axis",
+    }:
+        from .tensor_ops import (
+            _flatten_dims,
+            _insert_dims,
+            _squeeze,
+            _squeeze_inds_nd,
+            _squeeze_inds_nd_,
+            _stop_gradients,
+            c2ri,
+            collapse_axes,
+            ri2c,
+            swap_axis,
+        )
+
+        globals().update(
+            {
+                "_flatten_dims": _flatten_dims,
+                "_insert_dims": _insert_dims,
+                "_squeeze": _squeeze,
+                "_squeeze_inds_nd": _squeeze_inds_nd,
+                "_squeeze_inds_nd_": _squeeze_inds_nd_,
+                "_stop_gradients": _stop_gradients,
+                "c2ri": c2ri,
+                "collapse_axes": collapse_axes,
+                "ri2c": ri2c,
+                "swap_axis": swap_axis,
+            }
+        )
+        return globals()[name]
+
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")

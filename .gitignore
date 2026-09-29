@@ -1,12 +1,19 @@
+__pycache__/
+.ipynb_checkpoints/
+.pytest_cache/
 .vscode/
+.DS_Store
 build/
-__pycache__
-.ipynb_checkpoints
-.pytest_cache
-.logs
-dev
-_build
+_build/
+
+# run-time artifacts
 logs/
-dev/
+logs*/
+/img/
+/onnx_models/
+*.tfrecord
 **/*_cov_mat.npy
-*.csv
+**/*_cov_meta.json
+
+# datasets (see README)
+/data/

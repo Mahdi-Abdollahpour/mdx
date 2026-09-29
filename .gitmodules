@@ -1,0 +1,4 @@
+[submodule "ext/sionna"]
+	path = ext/sionna
+	url = https://github.com/Mahdi-Abdollahpour/sionna.git
+	branch = mhd-v0.19.2

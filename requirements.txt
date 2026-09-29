@@ -1,0 +1,12 @@
+# Python 3.10, TensorFlow 2.15 (install the TensorFlow build matching your CUDA setup,
+# e.g. `pip install "tensorflow[and-cuda]==2.15.*"` on Linux with NVIDIA GPUs).
+tensorflow==2.15.*
+numpy<2
+scipy>=1.6
+matplotlib>=3.5.3
+h5py
+pandas
+# Sionna is provided by the ext/sionna submodule: `pip install -e ext/sionna`
+# optional
+graphviz      # renders block-graph diagrams during training (also needs the `dot` binary)
+jupyter       # evaluation notebooks
