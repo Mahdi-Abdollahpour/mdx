@@ -2,31 +2,18 @@
 # mahdi.abdollahpour@unibo.it
 # 2026
 
-"""CHEA: Channel Estimation Attention.
+"""CHEA (Channel Estimation Attention) for 5G NR PUSCH, arXiv:2607.16462.
 
-Scalable windowed multi-resolution attention channel estimator for 5G NR
-PUSCH (arXiv 2607.16462).
+Resource grids use shape [B, F, S, 2]: batch, subcarriers, OFDM symbols
+(S=14), and real/imaginary parts. The default estimator extracts pilots,
+encodes them at high resolution (HR) and pooled low resolution (LR), then
+uses local cross-attention to refine them. A dense map per PRB expands the
+pilots to the full slot.
 
-Input and output are resource grids of shape [B, F, S, 2] (F subcarriers,
-S=14 OFDM symbols, real/imag). With the default configuration
-(``decoder_type='lr_cross_attn'``, ``upsample_method='I'``):
-
-1. Pilot extraction: the pilot OFDM symbols ``pilot_syms`` are gathered,
-   giving a pilot grid of shape [B, F, 2, 2].
-2. Tokenization: one token per PRB (12 subcarriers) per (pilot symbol, re/im).
-3. High-resolution encoder: self-attention within windows of ``hr_prbs`` PRBs.
-4. Low-resolution encoder: masked average pooling over groups of
-   ``pool_factor`` PRBs, then self-attention within windows of ``lr_prbs`` PRBs.
-5. Local cross-attention decoder: queries are the high-resolution tokens of a
-   PRB group, keys/values the low-resolution tokens of the same group.
-6. Upsampling: a per-PRB linear map from the pilot symbols to the full slot.
-
-``CHEAStack`` chains several pilot-grid refinement stages (``CHEAStage``) with
-trainable residual scales and a single final upsampling.
-
-F must be a multiple of 12; other sizes are zero-padded internally to a whole
-number of windows and cropped on output. An optional PRB mask restricts the
-estimator to a contiguous prefix of valid PRBs.
+CHEAStack runs several CHEAStage refiners with residual scaling, then
+upsamples once. F must be a multiple of 12. Incomplete windows are padded
+internally and cropped from the output. An optional PRB mask selects a
+contiguous prefix of valid PRBs.
 """
 
 from __future__ import annotations
@@ -41,23 +28,46 @@ from .registry import register_block
 
 
 def _ceil_to_multiple(value: int, multiple: int) -> int:
-    """Round ``value`` up to the nearest positive multiple."""
+    """Round value up to a multiple of the given size."""
     assert multiple > 0, f"multiple must be positive, got {multiple}"
     return ((int(value) + multiple - 1) // multiple) * multiple
 
 
 def _lcm(a: int, b: int) -> int:
-    """Return the least common multiple of two positive integers."""
+    """Return the least common multiple of positive integers a and b."""
     a, b = int(a), int(b)
     assert a > 0 and b > 0, f"lcm inputs must be positive, got {a}, {b}"
     return abs(a * b) // math.gcd(a, b)
 
 
-class PosEncoding(layers.Layer):
-    """Learnable additive positional encoding of shape [1, seq_len, d_model].
+def _block_span(start: int, stop: int, block: int):
+    """Return the block range [b0, b1) and edge padding for [start, stop)."""
+    b0 = start // block
+    b1 = -(-stop // block)
+    return b0, b1, start - b0 * block, b1 * block - stop
 
-    The embedding broadcasts over the leading axis, so it is shared across the
-    batch and across all windows when applied to [B*N_win, seq_len, d_model].
+
+def _pad_axis1(x, front: int, back: int):
+    """Add front and back zeros along axis 1."""
+    if front == 0 and back == 0:
+        return x
+    pads = [[0, 0]] * len(x.shape)
+    pads[1] = [front, back]
+    return tf.pad(x, pads)
+
+
+def _periodic_pos(pos_layer, start: int, n: int):
+    """Get positional embeddings for n tokens, wrapping from start."""
+    if not pos_layer.built:
+        pos_layer.build((None, pos_layer._seq, pos_layer._d))
+    idx = [(start + t) % pos_layer._seq for t in range(n)]
+    return tf.gather(pos_layer.embed, idx, axis=1)  # [1, n, d]
+
+
+class PosEncoding(layers.Layer):
+    """Add learned positions shared across batches and windows.
+
+    The embedding has shape [1, seq_len, d_model].
     """
 
     def __init__(self, seq_len: int, d_model: int, **kwargs):
@@ -79,7 +89,7 @@ class PosEncoding(layers.Layer):
 
 
 class _MHA(layers.Layer):
-    """Scaled dot-product multi-head attention (self- or cross-attention)."""
+    """Multi-head self- or cross-attention with scaled dot products."""
 
     def __init__(self, d_model: int, n_heads: int, **kwargs):
         super().__init__(**kwargs)
@@ -94,9 +104,10 @@ class _MHA(layers.Layer):
         self.out     = layers.Dense(d_model, use_bias=True, name="out")
 
     def call(self, x, kv=None, q_mask=None, kv_mask=None):
-        """Attend from ``x`` [B, Sq, d] to ``kv`` [B, Sk, d], or to ``x`` if ``kv`` is None.
+        """Use x [B, Sq, d] as queries and kv [B, Sk, d] as memory.
 
-        ``q_mask`` [B, Sq] and ``kv_mask`` [B, Sk] are optional 0/1 token masks.
+        With kv=None, attend to x itself. Optional 0/1 masks q_mask [B, Sq]
+        and kv_mask [B, Sk] mark valid query and memory tokens.
         """
         src = x if kv is None else kv
         if kv is None and kv_mask is None:
@@ -130,14 +141,14 @@ class _MHA(layers.Layer):
 
 
 def _apply_token_mask(x, mask):
-    """Zero masked tokens while keeping static tensor shapes unchanged."""
+    """Zero invalid tokens without changing the tensor shape."""
     if mask is None:
         return x
     return x * tf.cast(mask[..., None], x.dtype)
 
 
 class _FFN(layers.Layer):
-    """Position-wise feed-forward network d_model -> ffn_dim -> ... -> d_model (GELU)."""
+    """Per-token MLP with ffn_dim-wide GELU layers and d_model-wide output."""
 
     def __init__(self, d_model: int, ffn_dim: int, depth: int = 2, **kwargs):
         super().__init__(**kwargs)
@@ -154,11 +165,7 @@ class _FFN(layers.Layer):
 
 
 class _EncoderBlock(layers.Layer):
-    """Pre-LN transformer encoder block.
-
-    x → LN → MHA(self) → + x
-      → LN → FFN        → + x
-    """
+    """Self-attention and an FFN with pre-normalization and residual connections."""
 
     def __init__(self, d_model: int, n_heads: int, ffn_dim: int, ffn_depth: int = 2, **kwargs):
         super().__init__(**kwargs)
@@ -177,12 +184,7 @@ class _EncoderBlock(layers.Layer):
 
 
 class _DecoderBlock(layers.Layer):
-    """Pre-LN transformer decoder block.
-
-    x     → LN → Self-Attn(Q=K=V=x)        → + x
-    (x,m) → LN → Cross-Attn(Q=x, K=V=m)   → + x
-    x     → LN → FFN                        → + x
-    """
+    """Pre-normalized self-attention, cross-attention, and FFN with residuals."""
 
     def __init__(self, d_model: int, n_heads: int, ffn_dim: int, ffn_depth: int = 2, **kwargs):
         super().__init__(**kwargs)
@@ -208,11 +210,10 @@ class _DecoderBlock(layers.Layer):
 
 
 class TokenProcessor(layers.Layer):
-    """Optional MLP applied to each flattened pilot patch before tokenization.
+    """Process each pilot patch with an MLP before creating tokens.
 
-    Input and output have shape [B, N_win, N_p, P, 2, 2] (P = patch_size pilot
-    subcarriers, 2 pilot symbols, re/im); the last three axes are flattened
-    for the MLP.
+    Keeps shape [B, N_win, N_p, P, 2, 2], where P=patch_size. The MLP
+    flattens the last three axes: pilot subcarriers, symbols, and real/imag.
     """
 
     def __init__(
@@ -270,43 +271,43 @@ PILOT_PER_PRB = 6
 
 @register_block
 class CHEA(layers.Layer):
-    """CHEA channel estimator: windowed multi-resolution attention.
+    """Refine a channel grid [B, F, S, 2] using HR and LR windowed attention.
 
-    Maps a resource grid [B, F, S, 2] (e.g. an LS estimate) to a refined
-    channel estimate of the same shape. The layer can also be called with
-    ``(x, prb_mask)``, where ``prb_mask`` [B, F, S, 2] marks a contiguous
-    prefix of valid PRBs.
+    Accepts x or (x, prb_mask), where the mask has the same shape as x and
+    marks a contiguous prefix of valid PRBs. Returns the full grid by
+    default, or the refined pilot grid when upsampling is disabled.
 
     Args:
-        d_model: Transformer embedding dimension.
+        d_model: Token embedding width.
         n_heads: Number of attention heads.
-        enc_layers: Encoder blocks per branch (high and low resolution).
-        dec_layers: Decoder blocks (unused for ``decoder_type='fc3'``).
-        decoder_type: ``'lr_cross_attn'`` (queries from the high-resolution
-            encoder, keys/values from the low-resolution encoder),
-            ``'cross_attn'`` (queries from the fused pilot grid, keys/values
-            from the high-resolution encoder) or ``'fc3'`` (MLP decoder).
-        fuse_mode: ``'sum'`` or ``'concat'`` (1x1 convolution); fusion of the
-            two branches for ``'cross_attn'`` and ``'fc3'``.
-        upsample_method: ``'I'`` (per-PRB dense map) or ``'II'`` (per-token
-            dense map).
-        hr_prbs: PRBs per high-resolution window.
-        lr_prbs: PRBs per low-resolution window.
-        pool_factor: Average-pooling factor of the low-resolution branch.
-        ffn_mult: FFN hidden width as a multiple of ``d_model``.
-        ffn_depth: Number of dense layers per FFN (>= 2).
-        pilot_stride: Subcarrier stride of the pilot extraction.
-        patch_size: Pilot subcarriers per token; both upsampling methods
-            assume ``pilot_stride * patch_size == 12``.
-        pilot_syms: Indices of the pilot OFDM symbols.
-        enable_token_processor: Apply a ``TokenProcessor`` MLP to each patch
-            instead of a linear token projection.
-        token_processor_hidden_dims: Hidden widths of the ``TokenProcessor``;
-            a non-empty value enables it.
-        decoder_out_proj: If False, the decoder returns ``d_model``-wide
-            tokens instead of projecting back to ``patch_size``.
-        enable_upsampling: If False, return the refined pilot grid instead of
-            the full resource grid.
+        enc_layers: Encoder blocks in each HR and LR branch.
+        dec_layers: Decoder blocks; ignored by 'fc3'.
+        decoder_type: 'lr_cross_attn' uses HR queries and LR memory;
+            'cross_attn' uses fused pilot queries and HR memory;
+            'fc3' uses an MLP.
+        fuse_mode: Merge branches by 'sum' or 'concat' with a 1x1 convolution.
+            Used by 'cross_attn' and 'fc3'.
+        upsample_method: Dense map per PRB ('I') or per token ('II').
+        hr_prbs: PRBs per HR window.
+        lr_prbs: PRBs per LR window.
+        pool_factor: LR average-pooling factor.
+        ffn_mult: FFN hidden width as a multiple of d_model.
+        ffn_depth: Dense layers per FFN, at least 2.
+        pilot_stride: Subcarrier step when extracting pilots.
+        patch_size: Pilot subcarriers per token. For one patch per PRB,
+            pilot_stride * patch_size must equal 12.
+        pilot_syms: Pilot OFDM symbol indices.
+        enable_token_processor: Use a patch MLP instead of a linear projection.
+        token_processor_hidden_dims: Patch MLP hidden widths; non-empty
+            values also enable the MLP.
+        decoder_out_proj: Project decoder tokens to patch_size. If False,
+            keep d_model-wide tokens.
+        enable_upsampling: Expand pilots to the full grid; otherwise return pilots.
+        drop_pad_tokens: Skip window-padding tokens during inference when
+            no PRB mask is supplied and decoder_out_proj is True.
+        single_window_attn: For one partial window with drop_pad_tokens,
+            'keep_pads' keeps padding, 'drop_pad_q' removes padded queries,
+            and 'drop_pad_qk' removes padded queries and keys.
     """
 
     def __init__(
@@ -330,10 +331,16 @@ class CHEA(layers.Layer):
         token_processor_hidden_dims: tuple = (),
         decoder_out_proj: bool  = True,
         enable_upsampling: bool  = True,
+        drop_pad_tokens: bool  = True,
+        single_window_attn: str = "keep_pads",
         name:            str   = "chea",
         **kwargs,
     ):
         super().__init__(name=name, **kwargs)
+        assert single_window_attn in ("keep_pads", "drop_pad_q", "drop_pad_qk"), \
+            f"single_window_attn must be 'keep_pads', 'drop_pad_q' or 'drop_pad_qk'"
+        self.drop_pad_tokens    = bool(drop_pad_tokens)
+        self.single_window_attn = single_window_attn
 
         assert decoder_type     in ("cross_attn", "lr_cross_attn", "fc3"), \
             f"decoder_type must be 'cross_attn', 'lr_cross_attn', or 'fc3'"
@@ -384,7 +391,7 @@ class CHEA(layers.Layer):
                 "decoder_out_proj=False requires d_model to be divisible by patch_size"
             )
 
-        # window widths in pilot subcarriers
+        # Window widths are measured in pilot subcarriers.
         self._W_h = hr_prbs * self.patch_size
         self._W_l = lr_prbs * self.patch_size
         self._N_ph = hr_prbs
@@ -435,9 +442,11 @@ class CHEA(layers.Layer):
 
         if decoder_type in ("cross_attn", "lr_cross_attn"):
             if decoder_type == "lr_cross_attn":
-                _dec_pos_len = pool_factor * 4          # f_p HR patches x 4 tokens
+                # Four tokens per HR patch in the pooling group.
+                _dec_pos_len = pool_factor * 4
             else:
-                _dec_pos_len = hr_prbs * 4              # N_ph HR patches x 4 tokens
+                # Four tokens per HR patch in the window.
+                _dec_pos_len = hr_prbs * 4
             self._dec_pos    = PosEncoding(_dec_pos_len, d_model, name="dec_pos")
             self._dec_blocks = [
                 _DecoderBlock(d_model, n_heads, ffn_dim, ffn_depth=self.ffn_depth, name=f"dec_{i}")
@@ -445,14 +454,14 @@ class CHEA(layers.Layer):
             ]
             if decoder_type == "lr_cross_attn":
                 self._hr_skip_proj = layers.Dense(self.patch_size, use_bias=True, name="hr_skip_proj")
-        else:  # fc3
+        else:  # MLP decoder.
             self._fc3_1 = layers.Dense(d_model, use_bias=True, name="fc3_1")
             self._fc3_2 = layers.Dense(d_model, use_bias=True, name="fc3_2")
 
         if self.enable_upsampling:
             if upsample_method == "I":
                 self._ups_fc = layers.Dense(12 * 14 * 2, use_bias=True, name="ups_fc")
-            else:  # II
+            else:  # Per-token upsampling.
                 self._ups_fc = layers.Dense(12 * 7, use_bias=True, name="ups_fc")
         else:
             self._ups_fc = None
@@ -477,7 +486,7 @@ class CHEA(layers.Layer):
         self._input_has_prb_mask = False
 
     def _configure_shape_state(self, raw_F: int, raw_S: int, context: str = "CHEA"):
-        """Compute internal padded dimensions and window counts."""
+        """Set grid dimensions and window counts, padding incomplete windows."""
         raw_F = int(raw_F)
         raw_S = int(raw_S)
         assert raw_F > 0, f"{context}: F must be positive, got {raw_F}"
@@ -527,7 +536,7 @@ class CHEA(layers.Layer):
         self._pilot_sym_idx = tf.constant(self.pilot_syms, dtype=tf.int32)
 
     def _pad_full_grid_inputs(self, x, prb_mask=None):
-        """Pad full-grid inputs on the subcarrier axis to the build-time size."""
+        """Pad x and its optional mask to the internal subcarrier count."""
         if self._pad_subcarriers <= 0:
             return x, prb_mask
         paddings = [[0, 0], [0, self._pad_subcarriers], [0, 0], [0, 0]]
@@ -537,13 +546,13 @@ class CHEA(layers.Layer):
         return x, prb_mask
 
     def _pad_pilot_grid(self, pilots):
-        """Pad a pilot grid on the pilot-subcarrier axis to the internal size."""
+        """Pad pilots to the internal pilot-subcarrier count."""
         if self._pad_pilot_subcarriers <= 0:
             return pilots
         return tf.pad(pilots, [[0, 0], [0, self._pad_pilot_subcarriers], [0, 0], [0, 0]])
 
     def _pad_prb_mask(self, prb_mask):
-        """Pad an optional full-grid PRB mask to the internal full-grid size."""
+        """Pad the optional PRB mask to the internal grid size."""
         if prb_mask is None or self._pad_subcarriers <= 0:
             return prb_mask
         return tf.pad(
@@ -552,13 +561,13 @@ class CHEA(layers.Layer):
         )
 
     def _crop_full_grid(self, y):
-        """Remove internal full-grid padding before returning a result."""
+        """Crop the full grid to the input subcarrier count."""
         if self._pad_subcarriers <= 0:
             return y
         return y[:, :self._input_F, :, :]
 
     def _crop_pilot_grid(self, y):
-        """Remove internal pilot-grid padding before returning a result."""
+        """Remove padded pilots, accounting for expanded decoder tokens."""
         if self._pad_pilot_subcarriers <= 0:
             return y
         padded_F_half = self._F_half
@@ -572,11 +581,7 @@ class CHEA(layers.Layer):
         return y[:, : self._input_F_half * expansion, :, :]
 
     def build(self, input_shape):
-        """Create padded shape-dependent state from the input shape.
-
-        Args:
-            input_shape: [B, F, S, 2] or ([B, F, S, 2], prb_mask).
-        """
+        """Set up padding for [B, F, S, 2], with an optional matching mask shape."""
         try:
             self._input_has_prb_mask = (
                 isinstance(input_shape, (list, tuple))
@@ -591,36 +596,28 @@ class CHEA(layers.Layer):
         super().build(input_shape)
 
     def _extract_pilots(self, x):
-        """Gather pilot subcarriers and pilot OFDM symbols.
+        """Extract pilots from x [B, F, S, 2].
 
-        Args:
-            x: [B, F, S, 2].
-
-        Returns:
-            [B, F//pilot_stride, len(pilot_syms), 2]; with default pilot_syms,
-            [B, F//pilot_stride, 2, 2].
+        Returns [B, F//pilot_stride, len(pilot_syms), 2].
         """
         x = tf.gather(x, self._pilot_sub_idx, axis=1)
         x = tf.gather(x, self._pilot_sym_idx, axis=2)
         return x
 
     def _make_validity_masks(self, prb_mask, B):
-        """Build fixed-shape masks for PRB-prefix training.
+        """Build grid and token masks for a batch of size B.
 
-        Args:
-            prb_mask: optional bool-like mask with shape [B, F, S, 2].
-                Valid subcarriers are read from prb_mask[:, :, 0, 0].
-            B: dynamic batch size scalar.
+        Read valid subcarriers from prb_mask[:, :, 0, 0], if supplied.
+        Otherwise, mark the input PRBs valid and exclude internal padding.
 
-        Returns:
-            Dict of masks:
-                output: None or [B, F, S, 2]
-                pilot_valid: [B, F_half]
-                pilot_grid: [B, F_half, 1, 1]
-                hr_global: [B, N_p_hr]
-                hr_win: [B*N_wh, N_ph*4]
-                lr_global: [B, N_p_lr]
-                lr_win: [B*N_wl, N_pl*4]
+        Returns a dict of masks:
+            output: [B, F, S, 2], or None.
+            pilot_valid: [B, F_half].
+            pilot_grid: [B, F_half, 1, 1].
+            hr_global: [B, N_p_hr].
+            hr_win: [B*N_wh, N_ph*4].
+            lr_global: [B, N_p_lr].
+            lr_win: [B*N_wl, N_pl*4].
         """
 
         F_half = self._F_half
@@ -645,32 +642,25 @@ class CHEA(layers.Layer):
             prb_valid = tf.range(self._N_prbs)[None, :] < n_valid_prbs[:, None]  # [B, N_prbs]
             output_mask = prb_mask
 
-        # Pilot-grid validity: [B, F_half].
+        # Each valid PRB contributes its pilot subcarriers.
         pilot_valid = tf.repeat(prb_valid, repeats=pilots_per_prb, axis=1)
         pilot_valid = pilot_valid[:, :F_half]
 
         return self._make_masks_from_pilot_valid(pilot_valid, B, output_mask)
 
     def _make_masks_from_pilot_valid(self, pilot_valid, B, output_mask=None):
-        """Build token masks from pilot-grid validity.
+        """Convert pilot_valid [B, F//pilot_stride] to HR and LR token masks.
 
-        Args:
-            pilot_valid: bool-like tensor [B, F//pilot_stride].
-            B: dynamic batch size scalar.
-            output_mask: optional full-grid mask [B, F, S, 2].
-
-        Returns:
-            Mask dict used by the HR/LR branches and decoder.
+        Include the optional output_mask [B, F, S, 2] in the returned dict.
         """
         pilot_valid = tf.cast(pilot_valid, tf.bool)
 
-        # HR tokens are per-PRB when pilot_stride * patch_size == 12.
+        # One HR patch covers a PRB when pilot_stride * patch_size == 12.
         hr_patch_valid = tf.reshape(pilot_valid, [B, self._N_wh * self._N_ph, self.patch_size])
         hr_patch_valid = tf.reduce_any(hr_patch_valid, axis=-1)
         hr_token_valid = tf.repeat(hr_patch_valid, repeats=4, axis=1)        # [B, N_p_hr]
 
-        # LR pooled patches cover pool_factor PRBs. A pooled token is valid if
-        # at least one contributing pilot subcarrier is valid.
+        # Keep an LR token if any contributing pilot is valid.
         W_pooled = self._W_l // self.pool_factor
         lr_pool_valid = tf.reshape(pilot_valid, [B * self._N_wl, self._W_l, 1, 1])
         lr_pool_count = tf.nn.avg_pool2d(
@@ -696,22 +686,17 @@ class CHEA(layers.Layer):
         }
 
     def _reverse_pilot_masks(self, masks, B):
-        """Reverse pilot-axis masks for right-aligned stage windowing."""
+        """Reverse pilot validity and rebuild masks for right-aligned windows."""
         pilot_valid = tf.reverse(masks["pilot_valid"], axis=[1])
         return self._make_masks_from_pilot_valid(
             pilot_valid, B, output_mask=masks.get("output")
         )
 
     def _masked_lr_avg_pool(self, x, pilot_valid, B):
-        """Average-pool LR windows using only valid pilot subcarriers.
+        """Pool LR windows, averaging only pilots marked in pilot_valid [B, F_half].
 
-        Args:
-            x: [B, N_wl, W_l, 2, 2] or [B*N_wl, W_l, 2, 2].
-            pilot_valid: [B, F_half].
-            B: dynamic batch size scalar.
-
-        Returns:
-            [B*N_wl, W_l//pool_factor, 2, 2].
+        Accepts x [B, N_wl, W_l, 2, 2] or [B*N_wl, W_l, 2, 2].
+        Returns [B*N_wl, W_l//pool_factor, 2, 2].
         """
         N_wl, W_l, f_p = self._N_wl, self._W_l, self.pool_factor
         x_dtype = x.dtype
@@ -735,40 +720,26 @@ class CHEA(layers.Layer):
         return tf.cast(pooled, x_dtype)
 
     def _to_tokens(self, pilots, B, N_win, N_p, W,  token_processor=None):
-        """Convert a windowed pilot tensor to patch tokens.
+        """Turn pilots [B, N_win, W, 2, 2] into [B*N_win, N_p*4, patch_size] tokens.
 
-        Args:
-            pilots: [B, N_win, W, 2, 2] (W pilot subcarriers, 2 symbols, re/im).
-            B: dynamic batch size scalar.
-            N_win: number of windows (static int).
-            N_p: patches per window, W // patch_size (static int).
-            W: window width in pilot subcarriers (static int).
-            token_processor: optional ``TokenProcessor`` applied per patch.
-
-        Returns:
-            [B*N_win, N_p*4, patch_size].
+        Each window has N_p=W//patch_size patches, with four tokens per
+        patch for the two pilot symbols and real/imag parts. Apply
+        token_processor first, if supplied.
         """
         P = self.patch_size
         x = tf.reshape(pilots, [B, N_win, N_p, P, 2, 2])
         if token_processor is not None:
             x = token_processor(x)
-        # [B, N_win, N_p, 2, 2, P]
+        # Put pilot subcarriers last to form each token's features.
         x = tf.transpose(x, [0, 1, 2, 4, 5, 3])
         x = tf.reshape(x, [B * N_win, N_p * 4, P])
         return x
 
     def _from_tokens(self, tokens, B, N_win, N_p, F_half):
-        """Reconstruct pilot grid from patch tokens.
+        """Restore a pilot grid from tokens [B*N_win, N_p*4, token_width].
 
-        Args:
-            tokens: [B*N_win, N_p*4, token_width], token_width = patch_size * M.
-            B: dynamic batch size scalar.
-            N_win: number of windows (static int).
-            N_p: patches per window (static int).
-            F_half: F // pilot_stride.
-
-        Returns:
-            [B, F_half * M, 2, 2].
+        Returns [B, F_half*M, 2, 2], where M=token_width//patch_size and
+        F_half=F//pilot_stride.
         """
         P = self.patch_size
         token_width = tf.shape(tokens)[-1]
@@ -779,25 +750,16 @@ class CHEA(layers.Layer):
         M = token_width // P
         x = tf.reshape(tokens, [B, N_win, N_p, 4, token_width])
         x = tf.reshape(x, [B, N_win, N_p, 2, 2, token_width])
-        # [B, N_win, N_p, token_width, 2, 2]
+        # Restore subcarrier, pilot-symbol, and real/imag axes.
         x = tf.transpose(x, [0, 1, 2, 5, 3, 4])
         x = tf.reshape(x, [B, F_half * M, 2, 2])
         return x
 
     def _hr_branch(self, pilots, B, masks):
-        """Run the high-resolution pilot encoder branch.
+        """Encode pilots [B, F//pilot_stride, 2, 2] in HR windows using masks.
 
-        Args:
-            pilots: [B, F//pilot_stride, 2, 2].
-            B: dynamic batch size scalar.
-            masks: dict from _make_validity_masks.
-
-        Returns:
-            If decoder_type == "lr_cross_attn":
-                (None, memory [B, N_p_hr, d_model]).
-            Otherwise:
-                (pilot_grid [B, F//pilot_stride, 2, 2],
-                 memory [B, N_p_hr, d_model]).
+        Returns (pilot_grid, memory [B, N_p_hr, d_model]). The grid matches
+        the pilot shape, or is None for 'lr_cross_attn'.
         """
         F_half = self._F_half
         N_wh, N_ph, W_h = self._N_wh, self._N_ph, self._W_h
@@ -832,22 +794,11 @@ class CHEA(layers.Layer):
         return pilot_grid, memory
 
     def _lr_branch(self, pilots, B, masks):
-        """Run the low-resolution pilot encoder branch.
+        """Pool and encode pilots [B, F//pilot_stride, 2, 2] using masks.
 
-        Args:
-            pilots: [B, F//pilot_stride, 2, 2].
-            B: dynamic batch size scalar.
-            masks: dict from _make_validity_masks.
-
-        Returns:
-            If decoder_type == "lr_cross_attn":
-                (None, lr_tokens [B, N_p_lr, d_model]).
-            Otherwise:
-                (pilot_grid [B, F//pilot_stride, 2, 2], None).
-
-        For ``'lr_cross_attn'`` the encoder output is returned directly as the
-        decoder keys/values; otherwise it is projected back and bilinearly
-        upsampled to the pilot grid.
+        For 'lr_cross_attn', return (None, memory [B, N_p_lr, d_model]).
+        Otherwise, project and bilinearly resize to the input pilot shape,
+        returning (pilot_grid, None).
         """
         F_half = self._F_half
         N_wl, N_pl = self._N_wl, self._N_pl
@@ -857,8 +808,7 @@ class CHEA(layers.Layer):
 
         x = tf.reshape(pilots, [B, N_wl, W_l, 2, 2])
 
-        # Masked pooling averages over valid contributors only, so partially
-        # valid LR tokens keep their scale.
+        # Exclude invalid pilots from the average to preserve scale at the edges.
         x = self._masked_lr_avg_pool(x, masks["pilot_valid"], B)  # [B*N_wl, W_l//f_p, 2, 2]
         W_pooled = W_l // f_p
         x = tf.reshape(x, [B, N_wl, W_pooled, 2, 2])
@@ -883,7 +833,7 @@ class CHEA(layers.Layer):
         out = self._lr_out(tokens)
         out = _apply_token_mask(out, token_mask)
 
-        # Bilinear upsampling of each patch along subcarriers: P -> P*f_p.
+        # Expand each pooled patch from P to P*f_p subcarriers.
         P  = self.patch_size
         BN = B * N_wl
         Nseq = N_pl * 4
@@ -902,26 +852,24 @@ class CHEA(layers.Layer):
         return out, None
 
     def _decoder(self, fused, hr_memory, lr_memory, B, masks):
-        """Decode branch outputs back to the pilot grid.
+        """Decode HR and LR features into a refined pilot grid.
 
         Args:
-            fused: [B, F//pilot_stride, 2, 2], used by "cross_attn"/"fc3";
-                None for "lr_cross_attn".
-            hr_memory: [B, N_p_hr, d_model].
-            lr_memory: [B, N_p_lr, d_model], or None unless "lr_cross_attn".
-            B: dynamic batch size scalar.
-            masks: dict from _make_validity_masks.
+            fused: Pilot grid [B, F//pilot_stride, 2, 2]; None for 'lr_cross_attn'.
+            hr_memory: HR tokens [B, N_p_hr, d_model].
+            lr_memory: LR tokens [B, N_p_lr, d_model], used by 'lr_cross_attn'.
+            B: Batch size.
+            masks: Grid and token masks from _make_validity_masks.
 
         Returns:
-            [B, F//pilot_stride * M, 2, 2], where M=1 when
-            decoder_out_proj=True and M=d_model//patch_size otherwise.
+            [B, F//pilot_stride*M, 2, 2]. M is 1 with decoder_out_proj,
+            otherwise d_model//patch_size.
         """
         F_half = self._F_half
         N_wh, N_ph = self._N_wh, self._N_ph
 
         if self.decoder_type == "lr_cross_attn":
-            # Local cross-attention: each group of f_p*4 HR tokens (queries) attends
-            # to the 4 LR tokens (keys/values) of the corresponding LR patch.
+            # Each f_p*4 HR query group attends to its matching four LR tokens.
             f_p = self.pool_factor
             N_groups = B * self._N_wl * self._N_pl
 
@@ -951,11 +899,11 @@ class CHEA(layers.Layer):
             out = self._from_tokens(out_tok, B, N_wh, N_ph, F_half)
             return out * tf.cast(masks["pilot_grid"], out.dtype)
 
-        # cross_attn / fc3: tokenize the fused pilot grid.
+        # The other decoders use the fused pilot grid as input.
         P = self.patch_size
         token_mask_global = masks["hr_global"]
 
-        # [B, F_half, 2, 2] -> [B, N_wh, N_ph, 2, 2, P] -> [B, N_p_hr, P]
+        # Make four tokens per patch, one per pilot symbol and real/imag part.
         fused = fused * tf.cast(masks["pilot_grid"], fused.dtype)
         fused_r   = tf.reshape(fused, [B, N_wh, N_ph, P, 2, 2])
         fused_tok = tf.transpose(fused_r, [0, 1, 2, 4, 5, 3])
@@ -965,7 +913,7 @@ class CHEA(layers.Layer):
         skip = self._dec_skip_proj(fused_tok) if self._dec_out_proj is not None else None
 
         if self.decoder_type == "cross_attn":
-            # Local cross-attention: one group per HR window.
+            # Each query window attends to the matching HR memory window.
             N_groups = B * N_wh
             local_mask = tf.reshape(token_mask_global, [N_groups, N_ph * 4])
 
@@ -982,7 +930,7 @@ class CHEA(layers.Layer):
             x = tf.reshape(x, [B, self._N_p_hr, self.d_model])
             x = _apply_token_mask(x, token_mask_global)
             out_tok = self._dec_out_proj(x) if self._dec_out_proj is not None else x
-        else:  # fc3
+        else:  # MLP decoder.
             x = tf.keras.activations.gelu(
                 self._dec_in_proj(fused_tok), approximate=True
             )
@@ -1000,15 +948,10 @@ class CHEA(layers.Layer):
         return out * tf.cast(masks["pilot_grid"], out.dtype)
 
     def _refine_pilots(self, pilots, B, masks):
-        """Refine an extracted pilot grid without final upsampling.
+        """Encode and decode pilots [B, F//pilot_stride, len(pilot_syms), 2].
 
-        Args:
-            pilots: [B, F//pilot_stride, len(pilot_syms), 2].
-            B: dynamic batch size scalar.
-            masks: dict from _make_validity_masks.
-
-        Returns:
-            Refined pilot grid [B, F//pilot_stride * M, len(pilot_syms), 2].
+        Returns a refined pilot grid without upsampling. Its subcarrier
+        axis grows by d_model//patch_size if decoder_out_proj is False.
         """
         pilots = pilots * tf.cast(masks["pilot_grid"], pilots.dtype)
 
@@ -1028,14 +971,9 @@ class CHEA(layers.Layer):
         return self._decoder(fused, hr_memory, None, B, masks)
 
     def _upsample(self, x, B):
-        """Upsample the decoded pilot grid to the full resource grid.
+        """Expand decoded pilots [B, F//pilot_stride*M, 2, 2] to [B, F, 14, 2].
 
-        Args:
-            x: [B, F//pilot_stride * M, 2, 2].
-            B: dynamic batch size scalar.
-
-        Returns:
-            [B, F, 14, 2].
+        M is 1 with decoder_out_proj, otherwise d_model//patch_size.
         """
         N_prbs = self._N_prbs
         N_wh, N_ph = self._N_wh, self._N_ph
@@ -1049,16 +987,16 @@ class CHEA(layers.Layer):
         M = token_height // F_half
 
         if self.upsample_method == "I":
-            # Per-PRB dense map from the PRB's pilot values to its 12 x 14 x 2 grid.
+            # Map each PRB's pilots to its full 12 x 14 x 2 grid.
             pilots_per_prb = F_half // N_prbs
 
             x = tf.reshape(x, [B, N_prbs, pilots_per_prb * M, 2, 2])
             x = tf.reshape(x, [B, N_prbs, pilots_per_prb * M * 4])
-            # [B, N_prbs, 12 * 14 * 2]
+            # Predict all subcarriers, symbols, and real/imag parts for each PRB.
             x = self._ups_fc(x)
             x = tf.reshape(x, [B, N_prbs, 12, 14, 2])
             x = tf.reshape(x, [B, N_prbs * 12, 14, 2])
-        else:  # II
+        else:  # Per-token upsampling.
             assert self.pilot_stride * self.patch_size == 12, (
                 f"upsample_method='II' requires pilot_stride * patch_size == 12 "
                 f"(got {self.pilot_stride} * {self.patch_size} = "
@@ -1068,7 +1006,7 @@ class CHEA(layers.Layer):
             x = tf.reshape(x, [B, N_wh, N_ph, P * M, 2, 2])
             x = tf.transpose(x, [0, 1, 2, 4, 5, 3])
             x = tf.reshape(x, [B, N_prbs * 4, P * M])
-            # [B, N_prbs*4, 12 * 7]
+            # Each token predicts 12 subcarriers across 7 symbols.
             x = self._ups_fc(x)
             x = tf.reshape(x, [B, N_prbs * 4, 12, 7])
             x = tf.reshape(x, [B, N_prbs, 2, 2, 12, 7])
@@ -1079,16 +1017,15 @@ class CHEA(layers.Layer):
         return x
 
     def call(self, inputs, training=False):
-        """Run CHEA channel estimation.
+        """Refine a resource grid, optionally restricting it to valid PRBs.
 
         Args:
-            inputs: [B, F, S, 2], or ``(x, prb_mask)`` where ``prb_mask`` is a
-                [B, F, S, 2] bool/0-1 mask of a contiguous valid PRB prefix
-                starting at PRB 0.
-            training: unused; kept for Keras call compatibility.
+            inputs: Grid [B, F, S, 2] or (x, prb_mask). The bool/0-1 mask
+                has the same shape and marks valid PRBs starting at PRB 0.
+            training: If True, use the padded path for training.
 
         Returns:
-            [B, F, S, 2], or the refined pilot grid if upsampling is disabled.
+            Refined grid [B, F, S, 2], or pilots if upsampling is disabled.
         """
         if self._input_has_prb_mask:
             x, prb_mask = inputs
@@ -1096,11 +1033,17 @@ class CHEA(layers.Layer):
             x = inputs
             prb_mask = None
 
+        if self._use_pad_free(prb_mask, training):
+            refined = self._pf_refine(self._pf_extract_pilots(x), 0)
+            if not self.enable_upsampling:
+                return refined
+            return self._pf_upsample(refined)
+
         x, prb_mask = self._pad_full_grid_inputs(x, prb_mask)
         B = tf.shape(x)[0]
         masks = self._make_validity_masks(prb_mask, B)
 
-        # Zero inactive pilots before any bias, pooling or attention can leak them.
+        # Clear invalid pilots before projection, pooling, or attention.
         pilots = self._extract_pilots(x)
         pilots = pilots * tf.cast(masks["pilot_grid"], pilots.dtype)
 
@@ -1114,10 +1057,230 @@ class CHEA(layers.Layer):
             y = y * tf.cast(masks["output"], y.dtype)
         return self._crop_full_grid(y)
 
+    # Inference with drop_pad_tokens projects only valid tokens. The valid
+    # pilots occupy [o, o + Fv) in the padded grid's coordinates.
+
+    def _use_pad_free(self, prb_mask, training):
+        return (self.drop_pad_tokens and prb_mask is None and not training
+                and self.decoder_out_proj)
+
+    def _pf_extract_pilots(self, x):
+        """Extract [B, F//pilot_stride, len(pilot_syms), 2] pilots without padding."""
+        x = tf.gather(x, tf.range(0, x.shape[1], delta=self.pilot_stride), axis=1)
+        return tf.gather(x, tf.constant(self.pilot_syms, dtype=tf.int32), axis=2)
+
+    def _pf_to_tokens(self, pilots, token_processor=None):
+        """Tokenize [B, n_patch*P, 2, 2] as [B, n_patch*4, P], as in _to_tokens."""
+        P = self.patch_size
+        n_patch = pilots.shape[1] // P
+        x = tf.reshape(pilots, [-1, 1, n_patch, P, 2, 2])
+        if token_processor is not None:
+            x = token_processor(x)
+        x = tf.transpose(x, [0, 1, 2, 4, 5, 3])
+        return tf.reshape(x, [-1, n_patch * 4, P])
+
+    def _pf_from_tokens(self, tokens):
+        """Restore [B, n_patch*W, 2, 2] from [B, n_patch*4, W] tokens."""
+        n_patch, W = tokens.shape[1] // 4, tokens.shape[2]
+        x = tf.reshape(tokens, [-1, n_patch, 2, 2, W])
+        x = tf.transpose(x, [0, 1, 4, 2, 3])
+        return tf.reshape(x, [-1, n_patch * W, 2, 2])
+
+    def _pf_mha(self, mha, h, start, win, kv=None, kv_groups=None):
+        """Run windowed attention, projecting only valid tokens.
+
+        h [B, n, d] holds normalized queries at [start, start+n). Windows
+        contain win tokens and start at global position 0. kv is aligned
+        memory [B, n, d], or None for self-attention. kv_groups supplies
+        valid memory [B*n_win, S_k, d] for each window instead.
+
+        Partial windows get zero rows and masked keys after projection.
+        single_window_attn controls whether those rows are kept when only
+        one partial window is present.
+        """
+        n = h.shape[1]
+        d, H, D = mha.d_model, mha.n_heads, mha.d_head
+        w0, w1, front, back = _block_span(start, start + n, win)
+        n_win = w1 - w0
+        has_pads = front > 0 or back > 0
+        single = n_win == 1 and has_pads
+        drop_q = single and self.single_window_attn in ("drop_pad_q", "drop_pad_qk")
+        drop_k = single and self.single_window_attn == "drop_pad_qk" and kv_groups is None
+
+        q = mha.q_proj(h)
+        if kv_groups is None:
+            src = h if kv is None else kv
+            k, v = mha.k_proj(src), mha.v_proj(src)
+        else:
+            k, v = mha.k_proj(kv_groups), mha.v_proj(kv_groups)
+
+        def windows(t):
+            return tf.reshape(_pad_axis1(t, front, back), [-1, win, d])
+
+        q_w = q if drop_q else windows(q)
+        kv_mask = None
+        if kv_groups is None:
+            k_w, v_w = (k, v) if drop_k else (windows(k), windows(v))
+            if has_pads and not drop_k:
+                valid = tf.constant([0.0] * front + [1.0] * n + [0.0] * back)
+                valid = tf.reshape(valid, [1, n_win, win])
+                kv_mask = tf.reshape(tf.tile(valid, [tf.shape(h)[0], 1, 1]), [-1, win])
+        else:
+            k_w, v_w = k, v
+
+        def split(t):
+            t = tf.reshape(t, [tf.shape(t)[0], t.shape[1], H, D])
+            return tf.transpose(t, [0, 2, 1, 3])
+
+        qh, kh, vh = split(q_w), split(k_w), split(v_w)
+        scores = tf.matmul(qh, kh, transpose_b=True) * mha.scale
+        if kv_mask is not None:
+            kv_mask_f = tf.cast(kv_mask[:, None, None, :], scores.dtype)
+            scores = scores + (1.0 - kv_mask_f) * tf.cast(-1e9, scores.dtype)
+        weights = tf.nn.softmax(scores, axis=-1)
+        attn = tf.matmul(weights, vh)
+        attn = tf.transpose(attn, [0, 2, 1, 3])
+        attn = tf.reshape(attn, [-1, q_w.shape[1], d])
+        if not drop_q:
+            attn = tf.reshape(attn, [-1, n_win * win, d])[:, front:front + n]
+        return mha.out(attn)  # [B, n, d]
+
+    def _pf_encoder_block(self, blk, x, start, win):
+        x = x + self._pf_mha(blk.attn, blk.ln1(x), start, win)
+        return x + blk.ffn(blk.ln2(x))
+
+    def _pf_decoder_block(self, blk, x, start, win, memory=None, memory_groups=None):
+        x = x + self._pf_mha(blk.self_attn, blk.ln1(x), start, win)
+        x = x + self._pf_mha(blk.cross_attn, blk.ln2(x), start, win,
+                             kv=memory, kv_groups=memory_groups)
+        return x + blk.ffn(blk.ln3(x))
+
+    def _pf_hr_branch(self, pilots, o):
+        """Encode valid HR pilots; return (pilot_grid, memory, start).
+
+        pilot_grid is [B, Fv, 2, 2], or None for 'lr_cross_attn'.
+        memory is [B, n_hr, d]; start is its global token offset.
+        """
+        P, Fv = self.patch_size, pilots.shape[1]
+        p0, p1, fr, bk = _block_span(o, o + Fv, P)
+        tokens = self._pf_to_tokens(_pad_axis1(pilots, fr, bk), self._hr_token_processor)
+        start = 4 * p0
+        if not self.enable_token_processor:
+            tokens = self._hr_proj(tokens)
+        tokens = tokens + _periodic_pos(self._hr_pos, start, tokens.shape[1])
+        for blk in self._hr_enc:
+            tokens = self._pf_encoder_block(blk, tokens, start, self._N_ph * 4)
+        if self.decoder_type == "lr_cross_attn":
+            return None, tokens, start
+        out = self._pf_from_tokens(self._hr_out(tokens))[:, fr:fr + Fv]
+        return out, tokens, start
+
+    def _pf_lr_branch(self, pilots, o):
+        """Pool and encode valid LR pilots.
+
+        Return (None, memory [B, n_lr, d]) for 'lr_cross_attn', or
+        (pilot_grid [B, Fv, 2, 2], None) for the other decoders.
+        """
+        P, f, Fv = self.patch_size, self.pool_factor, pilots.shape[1]
+        dtype = pilots.dtype
+
+        g0, g1, fr, bk = _block_span(o, o + Fv, f)
+        x = _pad_axis1(pilots, fr, bk)
+        mask = tf.constant([0.0] * fr + [1.0] * Fv + [0.0] * bk, dtype=dtype)
+        mask = tf.reshape(mask, [1, -1, 1, 1])
+        x_sum = tf.nn.avg_pool2d(
+            x * mask, ksize=[f, 1], strides=[f, 1], padding="VALID", data_format="NHWC",
+        ) * tf.cast(f, dtype)
+        count = tf.nn.avg_pool2d(
+            mask, ksize=[f, 1], strides=[f, 1], padding="VALID", data_format="NHWC",
+        ) * tf.cast(f, dtype)
+        pooled = x_sum / tf.maximum(count, tf.cast(1.0, dtype))
+        pooled = pooled * tf.cast(count > 0.0, pooled.dtype)
+
+        l0, l1, lfr, lbk = _block_span(g0, g1, P)
+        tokens = self._pf_to_tokens(_pad_axis1(pooled, lfr, lbk), self._lr_token_processor)
+        start = 4 * l0
+        if not self.enable_token_processor:
+            tokens = self._lr_proj(tokens)
+        tokens = tokens + _periodic_pos(self._lr_pos, start, tokens.shape[1])
+        for blk in self._lr_enc:
+            tokens = self._pf_encoder_block(blk, tokens, start, self._N_pl * 4)
+        if self.decoder_type == "lr_cross_attn":
+            return None, tokens
+
+        out = self._lr_out(tokens)
+        n_tok = out.shape[1]
+        out = tf.reshape(out, [-1, P, 1, 1])
+        out = tf.image.resize(out, [P * f, 1], method="bilinear")
+        out = tf.reshape(out, [-1, n_tok, P * f])
+        out = self._pf_from_tokens(out)
+        s = o - l0 * P * f
+        return out[:, s:s + Fv], None
+
+    def _pf_refine(self, pilots, o):
+        """Refine pilots [B, Fv, 2, 2] at offset o, skipping window-padding tokens."""
+        P, Fv = self.patch_size, pilots.shape[1]
+        hr_out, hr_mem, hr_start = self._pf_hr_branch(pilots, o)
+        lr_out, lr_mem = self._pf_lr_branch(pilots, o)
+
+        if self.decoder_type == "lr_cross_attn":
+            Tg = self.pool_factor * 4
+            x = self._dec_in_proj(hr_mem)
+            x = x + _periodic_pos(self._dec_pos, hr_start, hr_mem.shape[1])
+            lr_groups = tf.reshape(lr_mem, [-1, 4, self.d_model])
+            for blk in self._dec_blocks:
+                x = self._pf_decoder_block(blk, x, hr_start, Tg, memory_groups=lr_groups)
+            out_tok = self._dec_out_proj(x) + self._hr_skip_proj(hr_mem)
+            s = o - (hr_start // 4) * P
+            return self._pf_from_tokens(out_tok)[:, s:s + Fv]
+
+        if self.fuse_mode == "sum":
+            fused = hr_out + lr_out
+        else:
+            fused = self._fuse_conv(tf.concat([hr_out, lr_out], axis=-1))
+
+        p0, p1, fr, bk = _block_span(o, o + Fv, P)
+        fused_tok = self._pf_to_tokens(_pad_axis1(fused, fr, bk))
+        skip = self._dec_skip_proj(fused_tok)
+        if self.decoder_type == "cross_attn":
+            x = self._dec_in_proj(fused_tok)
+            x = x + _periodic_pos(self._dec_pos, hr_start, fused_tok.shape[1])
+            for blk in self._dec_blocks:
+                x = self._pf_decoder_block(blk, x, hr_start, self._N_ph * 4, memory=hr_mem)
+            out_tok = self._dec_out_proj(x)
+        else:
+            x = tf.keras.activations.gelu(self._dec_in_proj(fused_tok), approximate=True)
+            x = tf.keras.activations.gelu(self._fc3_2(x), approximate=True)
+            out_tok = self._dec_out_proj(x)
+        out_tok = out_tok + skip
+        return self._pf_from_tokens(out_tok)[:, fr:fr + Fv]
+
+    def _pf_upsample(self, refined):
+        """Expand valid pilots [B, F//pilot_stride, 2, 2] to [B, F, 14, 2]."""
+        ppp = 12 // self.pilot_stride
+        n_prb = refined.shape[1] // ppp
+        if self.upsample_method == "I":
+            x = tf.reshape(refined, [-1, n_prb, ppp * 4])
+            x = self._ups_fc(x)
+            x = tf.reshape(x, [-1, n_prb, 12, 14, 2])
+            return tf.reshape(x, [-1, n_prb * 12, 14, 2])
+        assert self.pilot_stride * self.patch_size == 12
+        P = self.patch_size
+        x = tf.reshape(refined, [-1, n_prb, P, 2, 2])
+        x = tf.transpose(x, [0, 1, 3, 4, 2])
+        x = tf.reshape(x, [-1, n_prb * 4, P])
+        x = self._ups_fc(x)
+        x = tf.reshape(x, [-1, n_prb, 2, 2, 12, 7])
+        x = tf.transpose(x, perm=[0, 1, 4, 5, 2, 3])
+        x = tf.reshape(x, [-1, n_prb, 12, 14, 2])
+        return tf.reshape(x, [-1, n_prb * 12, 14, 2])
+
     def get_config(self):
-        """Return a serializable layer config."""
+        """Return the layer settings for serialization."""
         cfg = super().get_config()
         cfg.update({
+            "drop_pad_tokens":    self.drop_pad_tokens,
+            "single_window_attn": self.single_window_attn,
             "d_model":          self.d_model,
             "n_heads":          self.n_heads,
             "enc_layers":       self.enc_layers,
@@ -1140,19 +1303,19 @@ class CHEA(layers.Layer):
 
 
 class CHEAStage(CHEA):
-    """Single CHEA refinement stage operating on the pilot grid (no upsampling).
+    """Refine a pilot grid without upsampling.
 
-    Takes and returns a pilot grid [B, F//pilot_stride, len(pilot_syms), 2].
-    With ``residual_refine``, the output is ``x + alpha * (CHEA(x) - x)`` with
-    a trainable scalar ``alpha`` initialized to ``residual_scale_init``.
+    Input and output use shape [B, F//pilot_stride, len(pilot_syms), 2].
+    With residual_refine, return x + alpha * (refined - x). Alpha starts
+    at residual_scale_init and can be learned or fixed.
 
     Args:
-        residual_refine: Blend the refinement into the input with ``alpha``.
-        residual_scale_init: Initial value of ``alpha``.
-        trainable_residual_scale: Whether ``alpha`` is trainable.
-        window_alignment: ``'left'`` aligns windows to the first subcarrier,
-            ``'right'`` to the last one.
-        **kwargs: ``CHEA`` arguments.
+        residual_refine: Blend the refinement into the input using alpha.
+        residual_scale_init: Starting value of alpha.
+        trainable_residual_scale: Learn alpha during training.
+        window_alignment: Align windows to the first ('left') or last
+            ('right') subcarrier.
+        **kwargs: Options passed to CHEA.
     """
 
     def __init__(
@@ -1178,11 +1341,7 @@ class CHEAStage(CHEA):
         self._residual_scale = None
 
     def build(self, input_shape):
-        """Create padded shape state from a pilot-grid input shape.
-
-        Args:
-            input_shape: [B, F//pilot_stride, len(pilot_syms), 2].
-        """
+        """Set up padding and residual scaling for the input pilot grid."""
         pilot_shape = input_shape[0] if (
             isinstance(input_shape, (list, tuple))
             and len(input_shape) == 2
@@ -1208,21 +1367,24 @@ class CHEAStage(CHEA):
         super(CHEA, self).build(input_shape)
 
     def call(self, inputs, validity_masks=None, training=False):
-        """Refine a pilot grid.
+        """Refine pilots, with optional masking and residual scaling.
 
         Args:
-            inputs: [B, F//pilot_stride, len(pilot_syms), 2], or
+            inputs: Pilot grid [B, F//pilot_stride, len(pilot_syms), 2], or
                 (pilot_grid, prb_mask).
-            validity_masks: optional mask dict from CHEA._make_validity_masks.
-            training: unused; included for Keras call compatibility.
+            validity_masks: Prebuilt masks from CHEA._make_validity_masks.
+            training: If True, use the padded path for training.
 
         Returns:
-            [B, F//pilot_stride, len(pilot_syms), 2].
+            Refined pilots with the same shape as the input grid.
         """
         if isinstance(inputs, (list, tuple)) and len(inputs) == 2:
             pilots, prb_mask = inputs
         else:
             pilots, prb_mask = inputs, None
+
+        if validity_masks is None and self._use_pad_free(prb_mask, training):
+            return self._pf_stage(pilots)
 
         if validity_masks is None:
             pilots = self._pad_pilot_grid(pilots)
@@ -1235,8 +1397,7 @@ class CHEAStage(CHEA):
 
         original_masks = masks
         if self.window_alignment == "right":
-            # Process the grid in reversed pilot order so that windows are aligned
-            # to the high-frequency end.
+            # Reverse pilots so windows start at the high-frequency edge.
             pilots = tf.reverse(pilots, axis=[1])
             masks = self._reverse_pilot_masks(masks, B)
 
@@ -1253,8 +1414,23 @@ class CHEAStage(CHEA):
 
         return self._crop_pilot_grid(refined)
 
+    def _pf_stage(self, pilots):
+        """Refine unpadded pilots [B, Fv, len(pilot_syms), 2].
+
+        For right alignment, reverse the pilots and use offset
+        o=padded_F_half-Fv to match the padded grid's window positions.
+        """
+        Fv = pilots.shape[1]
+        right = self.window_alignment == "right"
+        p = tf.reverse(pilots, axis=[1]) if right else pilots
+        o = _ceil_to_multiple(Fv, _lcm(self._W_h, self._W_l)) - Fv if right else 0
+        refined = self._pf_refine(p, o)
+        if self.residual_refine:
+            refined = p + tf.cast(self._residual_scale, refined.dtype) * (refined - p)
+        return tf.reverse(refined, axis=[1]) if right else refined
+
     def get_config(self):
-        """Return a serializable layer config."""
+        """Return the stage settings for serialization."""
         cfg = super().get_config()
         cfg.update({
             "residual_refine": self.residual_refine,
@@ -1267,21 +1443,19 @@ class CHEAStage(CHEA):
 
 @register_block
 class CHEAStack(CHEA):
-    """Stack of ``num_stages`` independent ``CHEAStage`` refiners with one final upsampling.
+    """Refine pilots through independent CHEAStage layers, then upsample once.
 
-    Input and output are resource grids [B, F, S, 2] (optionally with a PRB
-    mask, as for ``CHEA``). The pilot grid is refined by each stage in turn
-    and then upsampled once to the full slot.
+    Accepts and returns a resource grid [B, F, S, 2], with an optional PRB
+    mask as in CHEA.
 
     Args:
         num_stages: Number of refinement stages.
-        residual_refine: Use trainable residual scales in every stage.
-        residual_scale_init: Initial value of the residual scales.
-        trainable_residual_scale: Whether the residual scales are trainable.
-        stage_window_alignment: ``'left'``, ``'right'``, ``'alternate'``
-            (left/right alternating across stages) or a sequence of
-            ``'left'``/``'right'`` values cycled over the stages.
-        **kwargs: ``CHEA`` arguments shared by all stages.
+        residual_refine: Blend each stage's refinement using a residual scale.
+        residual_scale_init: Starting value of each residual scale.
+        trainable_residual_scale: Learn the residual scales during training.
+        stage_window_alignment: 'left', 'right', or 'alternate' (left, then
+            right). A sequence of 'left'/'right' values cycles over stages.
+        **kwargs: CHEA options shared by all stages.
     """
 
     def __init__(
@@ -1325,6 +1499,8 @@ class CHEAStack(CHEA):
             "residual_refine": self.residual_refine,
             "residual_scale_init": self.residual_scale_init,
             "trainable_residual_scale": self.trainable_residual_scale,
+            "drop_pad_tokens": self.drop_pad_tokens,
+            "single_window_attn": self.single_window_attn,
         }
         self._stages = [
             CHEAStage(
@@ -1337,7 +1513,7 @@ class CHEAStack(CHEA):
 
     @staticmethod
     def _normalize_stage_window_alignment(stage_window_alignment):
-        """Normalize stack window alignment to a string or tuple."""
+        """Validate the alignment setting and convert sequences to tuples."""
         if isinstance(stage_window_alignment, str):
             assert stage_window_alignment in ("left", "right", "alternate"), (
                 "stage_window_alignment must be 'left', 'right', 'alternate', "
@@ -1353,7 +1529,7 @@ class CHEAStack(CHEA):
         return alignment
 
     def _stage_window_alignment_for_index(self, index: int) -> str:
-        """Return the configured window alignment for one stack stage."""
+        """Choose a stage's alignment from the configured pattern."""
         alignment = self.stage_window_alignment
         if alignment == "alternate":
             return "right" if index % 2 else "left"
@@ -1362,21 +1538,27 @@ class CHEAStack(CHEA):
         return alignment[index % len(alignment)]
 
     def call(self, inputs, training=False):
-        """Run repeated pilot-grid refinement and one final upsampling.
+        """Run all pilot refinement stages, then expand to the full grid.
 
         Args:
-            inputs: [B, F, S, 2], or ``(x, prb_mask)`` with a [B, F, S, 2]
-                bool/0-1 PRB mask.
-            training: Keras training flag, passed to the stages.
+            inputs: Grid [B, F, S, 2] or (x, prb_mask). The bool/0-1 mask
+                has the same shape and marks valid PRBs starting at PRB 0.
+            training: Training flag passed to each stage.
 
         Returns:
-            [B, F, S, 2].
+            Refined grid [B, F, S, 2].
         """
         if self._input_has_prb_mask:
             x, prb_mask = inputs
         else:
             x = inputs
             prb_mask = None
+
+        if self._use_pad_free(prb_mask, training):
+            refined = self._pf_extract_pilots(x)
+            for stage in self._stages:
+                refined = stage(refined, training=training)
+            return self._pf_upsample(refined)
 
         x, prb_mask = self._pad_full_grid_inputs(x, prb_mask)
         B = tf.shape(x)[0]
@@ -1395,7 +1577,7 @@ class CHEAStack(CHEA):
         return self._crop_full_grid(y)
 
     def get_config(self):
-        """Return a serializable layer config."""
+        """Return the stack settings for serialization."""
         cfg = super().get_config()
         cfg.update({
             "num_stages": self.num_stages,
@@ -1405,4 +1587,3 @@ class CHEAStack(CHEA):
             "stage_window_alignment": self.stage_window_alignment,
         })
         return cfg
-
